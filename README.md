@@ -1,147 +1,98 @@
-# FlyRank ML Internship — Starter Repo
+# Capstone Report — Refresh / Content Opportunity Scoring
 
-**Applied Search Intelligence: Google Search Ranking & Discoverability**
+- **Author:** Idowu Thomas Adegoke
+- **Lane:** Refresh / Content Opportunity Scoring (a ranked review queue with reason codes)
+- **Repo:** https://github.com/Thomasayanfeoluwa/flyrank-data-pipeline
+- **Paper:** https://thomasayanfeoluwa.github.io/flyrank-data-pipeline/
+- **Notebook:** `work/notebooks/capstone.ipynb` (this report mirrors it; every number below matches `work/outputs/capstone_summary.json`)
+- **Date:** October 2026
 
-This is the starting point for the FlyRank ML Internship. You **clone it into your own public
-repo** (one click — *Use this template*), build everything there, and submit that repo URL on
-each assignment in your portal — it's your workspace, your submission, and your portfolio all
-at once. The rhythm is simple: do the work, commit it, submit on the card. Done.
+## 0. Abstract
 
-Everything here runs on a small **anonymized** slice of real FlyRank search data. No credentials,
-no private client data, no setup headaches.
+A content team with a few review hours a week needs to know which pages to open first when some quietly lose search impressions. I asked whether a readable model can rank pages so that the top of the list holds more pages that lost 30% or more of their impressions (last 30 days against the prior 30) than random picking does. I compared a hand-written rule, Logistic Regression and gradient boosting on an anonymized FlyRank snapshot of 21,758 pages from 30 clients, holding out whole clients in every validation fold. On unseen clients, Logistic Regression's top 500 pages were decaying 79.4% of the time against a 51.4% base rate (lift 1.55×, 95% interval 1.22 to 1.87), while a random split had inflated gradient boosting's equivalent figure from 0.71 to 0.94. Most of the measured skill came from 90-day activity numbers that overlap the label window, and precision moved with the population rule, so the queue is observed, directional decision support for human screening, not a forecast and not evidence that refreshing a page helps.
 
-> **New here?** Two reads: **[SETUP.md](SETUP.md)** (GitHub, Colab, and data access — ten
-> minutes, with every silent pitfall flagged), then **[GUIDE.md](GUIDE.md)** (every file
-> explained, what to edit vs. leave alone, and where your own work goes — five minutes).
+## 1. Problem framing
 
----
+- **Decision supported:** which pages an editor opens first for review (refresh, expand, leave alone, or monitor).
+- **Unit of analysis:** one content page.
+- **Output:** a score for every page in the review population, a ranked queue, and per page a reason code, a confidence label (`higher` at 500 or more impressions in 90 days, otherwise `lower`) and a protect check (page one, at least 180 days old).
+- **Human action:** an editor works the queue top-down, about 500 pages per cycle (assumed capacity), verifies the decline, then decides.
+- **Cost of a wrong call:** a false positive costs about 15 minutes of review (an assumption). 103 of the top 500 did not decay, which is about 26 hours of that cycle's roughly 125. A false negative leaves a decaying page unreviewed: 4,436 of the 11,174 decayed pages (40%) ranked in the bottom half.
+- **Why ML helps:** the hand-written rule finds decaying pages only in a narrow group (7.0% of pages flagged). A model can rank all pages. Its gain over the rule is modest and uncertain (section 5).
+- **Link to FlyRank's work:** FlyRank's March 2026 report, *The State of AI-Driven SEO*, advises refreshing strong content before it decays. This work asks which pages to look at first. It does not test the report's refresh findings, which are observational cohort comparisons.
 
-## Quickstart — first win in 2 minutes
+## 2. Data safety
 
-The fastest path is Google Colab (one click, zero install). Open Notebook 1 and run all cells:
+- **Data:** the FlyRank ML Internship starter release (`content_refresh_anonymized.csv`): 30,000 pages, 44 columns, 32 clients, one snapshot, hashed identifiers.
+- **Population:** 26,612 pages have a prior-30-day baseline. The review population is the 21,758 of those with at least 100 impressions in 90 days (30 clients).
+- **Excluded columns:** `trend_direction`, `trend_pct` and the label itself; every `_last_30d` and `_prev_30d` window column (they define or sit inside the label); `content_id` and `client_id` (client_id is used only to group folds). 34 features remain.
+- **Leakage checks:**
+  1. The label and window columns are excluded, with assertions in the code.
+  2. A deliberate leak (adding the two label-window columns) lifted gradient boosting's AUC from 0.667 to 0.999 and P@500 from 0.710 to 1.00; removing them restored 0.667 and 0.710.
+  3. The 90-day totals still overlap the label windows (the two windows hold a median of 56% of each page's 90-day impressions). Section 6 measures what that costs.
+- **Public safety:** no client names, domains, URLs, titles, keywords or private queries appear in `work/`, the paper or the figures. No dataset files are committed. The ranked queue file is not committed.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/notebooks/01_first_look_and_discovery.ipynb?flush_cache=true)
- **Week 1 — Run it, then discover a real truth yourself**
+## 3. Baseline
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/notebooks/02_your_first_readable_model.ipynb?flush_cache=true)
- **Week 2 — The model is just a rule you can read**
+- **Rule (Week-4, no training):** flag pages with 100 to 499 impressions in 90 days that have not been updated for 91 days or more, scored as `min(days_since_update, 365)/365 × (500 − impressions)/400`. All other pages score 0. It flags 1,531 pages (7.0%).
+- **Why it is a fair comparison:** it is scored on the same 21,758 pages, the same five client-grouped folds and the same metric as the models. Its cutoffs were chosen after looking at two signal tables on this same data, so it is somewhat optimistic and the comparison is conservative toward the models.
+- **Its numbers:** P@500 0.618, lift 1.20× (0.92 to 1.35), AUC 0.511 against a 0.514 base rate.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/notebooks/03_working_with_the_full_release.ipynb?flush_cache=true)
- **Weeks 3+ — The full release (~79M rows) via DuckDB, no download needed** — hosted at
- [`FlyRank/internship-warehouse`](https://huggingface.co/datasets/FlyRank/internship-warehouse) (gated: request access + accept the data-use terms, approval is instant)
+## 4. Model / analysis
 
----
+- **Label (proxy):** a page is *decaying* if its impressions in the last 30 days fell 30% or more against the prior 30 days. The cutoff is an assumption, not tuned, and is stricter than FlyRank's report, which calls a page "down" at a 10% decline.
+- **Models:** Logistic Regression (one-hot categories, scaled numbers) and `HistGradientBoostingClassifier`, with fixed settings and seed 42.
+- **Features:** every column except the excluded ones in section 2, in six families (visibility consistency, volume, position and CTR, on-page engagement, page profile, keyword and source). The exact list is `FEATURES` in the notebook's setup cell.
+- **Queue:** the final queue uses the Logistic Regression score from client-grouped out-of-fold scoring.
 
-## Your assignment notebooks — open, fill, save, done
+## 5. Evaluation
 
-Every assignment is one pre-named skeleton notebook in `work/notebooks/`. Click its badge,
-fill the sections in order, then **File → Save a copy in GitHub → OK** — the dialog is
-already pre-filled with your repo and the right path.
+- **Split:** five-fold cross-validation grouped by client (zero shared clients between train and test). A time-aware split is not possible with one snapshot. The folds are uneven; fold 1 is a single client.
+- **Metrics (pooled out-of-fold, base rate 0.514):**
 
-> **The badges know whose repo they're in.** About 30 seconds after you create your copy, an
-> automatic commit ("Point Colab badges at this copy") rewires every badge in it to open
-> **your** notebooks — with your saved work — instead of the shared read-only ones. Reading
-> this on the shared starter page? The badges below open blank previews; make your copy
-> first ([SETUP.md](SETUP.md), Moment 1).
-
-| Week | Card | Notebook | Open |
+| Method | P@500 | Lift@500 (95% interval) | AUC |
 |---|---|---|---|
-| 1 | ML-02 | `w01_research_question` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/w01_research_question.ipynb?flush_cache=true) |
-| 2 | ML-03 | `w02_ml_task_framing` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/w02_ml_task_framing.ipynb?flush_cache=true) |
-| 3 | ML-04 | `w03_data_contract` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/w03_data_contract.ipynb?flush_cache=true) |
-| 3 | ML-05 | `w03_feature_leakage_check` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/w03_feature_leakage_check.ipynb?flush_cache=true) |
-| 4 | ML-06 | `w04_signal_audit` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/w04_signal_audit.ipynb?flush_cache=true) |
-| 4 | ML-07 | `w04_baseline_score` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/w04_baseline_score.ipynb?flush_cache=true) |
-| 5 | ML-08 | `w05_model` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/w05_model.ipynb?flush_cache=true) |
-| 6 | ML-09 | `w06_validation_audit` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/w06_validation_audit.ipynb?flush_cache=true) |
-| 7 | ML-10 | `w07_action_playbook` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/w07_action_playbook.ipynb?flush_cache=true) |
-| 8 | ML-11 | `capstone` | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/flyrank-bih/flyrank-ml-internship-starter/blob/main/work/notebooks/capstone.ipynb?flush_cache=true) |
+| Baseline rule | 0.618 | 1.20× (0.92 to 1.35) | 0.511 |
+| Logistic Regression | 0.794 | 1.55× (1.22 to 1.87) | 0.638 |
+| Gradient boosting | 0.710 | 1.38× (1.04 to 1.74) | 0.667 |
 
-Badges not opening *your* copy? Colab's built-in opener always works: **File → Open notebook
-→ GitHub tab** → paste `github.com/you/your-repo` → pick the notebook.
+- **Paired differences in lift@500:** Logistic Regression minus rule +0.35 (0.00 to 0.75); gradient boosting minus rule +0.21 (−0.14 to 0.59); Logistic Regression minus gradient boosting +0.15 (0.01 to 0.29).
+- **Random versus grouped split (P@500):** Logistic Regression 0.862 then 0.794; gradient boosting 0.936 then 0.710.
+- **Error analysis:** 103 of the Logistic Regression's top 500 did not decay (45 grew, 40 were stable, 18 fell a median of 25%). Missed decaying pages are larger (median 2,530 impressions against 1,728) and rank lower (average position 15.7 against 12.2).
 
-### Prefer local?
+## 6. Interpretation
 
-```bash
-git clone <this-repo-url>
-cd flyrank-ml-internship-starter
-pip install -r requirements.txt          # or: uv pip install -r requirements.txt
-python scripts/run_all.py
-```
+- Logistic Regression's top 500 hold more decaying pages than random (0.794 against 0.514) on unseen clients. Its advantage over the rule is directional, not settled. Gradient boosting cannot be told apart from the rule.
+- **Inputs overlap the label.** Using only the 17 page-attribute features, P@500 falls to 0.574 (Logistic Regression) and 0.484 (gradient boosting) against a 0.514 base rate. Part of what the models find is a decline that had already started. This work does not show that a model can anticipate decay.
+- **Population sensitivity.** Using prior-30-day impressions of at least 100 instead of 90-day impressions moved P@500 by 0.11 (Logistic Regression) and 0.21 (gradient boosting), while AUC moved by about 0.01 to 0.02. Precision figures are tied to the population rule and are directional.
+- **Reason codes in the top 2,000** (decay rate against a 0.514 base rate): `weak_position_or_ctr` 0.876, `visibility_gaps` 0.776, `keyword_or_source` 0.71, `weak_engagement` 0.69, `page_age_or_length` 0.64. Differences between codes were not tested, and a reason code describes what the model reacts to, not a cause.
+- **Negative and mixed results kept:** the random split was optimistic; the attribute-only models are near chance; the queue favors small pages (308 of the top 500 have under 500 impressions in 90 days) and holds only 0.4% of click-equivalent value (clicks × CPC, a proxy and not revenue).
 
-That runs the whole pipeline on the bundled sample and writes results to `outputs/`.
+## 7. Recommendation
 
----
+1. Use the queue as a screening list, top-down, about 500 pages per cycle.
+2. Verify the decline before any action (103 of the top 500 did not decay).
+3. Use the reason code to decide what to check on a page, not which page to open next.
+4. Protect healthy page-one pages (the 4,898 page-one pages at least 180 days old decayed at 0.458).
+5. Check value before spending the time.
+6. Treat `lower`-confidence pages with extra care.
+7. Keep publishing, rewriting, pruning, merging, redirecting and client promises manual.
+8. Re-score monthly. Re-audit if confirmed-decay precision falls below 0.62 in two batches, a batch's base rate leaves 0.38 to 0.72, reviewers reject more than 41% of top pages, a new client is added, or the label changes.
 
-## What you get
+**Confidence and limits:** observed on one snapshot of 30 clients. Directional decision support only. No evidence about interventions or how Google ranks pages. The intervals reflect only which clients are in the data, not the choice of label, cutoff or population rule.
 
-| Path | What it is |
-|---|---|
-| `notebooks/` | Week 1–2 **first-win notebooks** (Colab-ready). Start here. |
-| `scripts/01–05` + `run_all.py` | The runnable reference pipeline: prepare → baseline → train → evaluate → PDF. |
-| `data/raw/content_refresh_anonymized.csv` | The anonymized starter dataset (~30k pages). |
-| `outputs/` | Example outputs so you can see the **target shape** (`model_report.md`, `refresh_queue_sample.csv`, `charts/`). |
-| `work/` | **Your space.** Lane experiments and your capstone live here — see `work/README.md`. |
-| `docs/` | The core docs + the data dictionary (see below). |
+## 8. Reproducibility
 
-### Read these (in `docs/`)
+- **From a fresh clone:** open `work/notebooks/capstone.ipynb` in Colab (badge at the top of the notebook) and choose Runtime → Run all. The setup cell clones the public course starter repo and copies its `data/` folder.
+- **Seed:** 42. **Environment:** scikit-learn 1.6.1, pandas 2.2.3.
+- **Receipts committed:** `work/outputs/capstone_summary.json` (headline numbers, no ids, no data) and `work/figures/` (the four paper figures). The ranked queue file is regenerated by the notebook and is not committed.
+- **No sealed or holdout evaluation is claimed.**
+- **Small numerical differences between runs** can move a page or two in the top 500 (for example 397 against 398 of 500).
 
-1. **`ml-core-foundation-framework.md`** — the first-principles map of ML as a whole system. The backbone of the live sessions.
-2. **`ml-intern-dataset-and-lane-guide.md`** — how to use the data safely, the capstone workflow, and the analysis "lanes" you can pick from.
-3. **`intern-free-tooling-guide.md`** — the zero-budget tool stack (Python, Colab, free AI assistants). You never need to pay for anything.
-4. **`data-dictionary.md`** — all 44 columns: meaning, scale, and gotchas. Keep it open while you work.
+## 9. Acknowledgments & data credit
+
+Built on the FlyRank ML Internship dataset, from [FlyRank](https://flyrank.ai). Thank you to the FlyRank team for the data and the programme.
 
 ---
 
-## The pipeline (what `run_all.py` does)
-
-```text
-01_prepare_features.py   clean + build the feature vector, define the label
-02_baseline_score.py     a transparent hand-rule "fix this first" score
-03_train_model.py        logistic regression, decision tree, random forest (client-holdout split)
-04_evaluate_and_export.py  ranked queue + charts + Markdown report
-05_build_pdf_report.py   a shareable PDF summary
-```
-
-On the bundled sample, the learned model clearly beats the hand-written rule at picking the right
-pages to review first (**Precision@50 ≈ 0.24 → 0.74**; the model number can land 0.68–0.74
-depending on library versions — the ~3x lift is the point). The notebooks compute these numbers
-live, so they always reflect the current data and environment.
-
-**Teaching point:** the model is the capstone, but the *workflow* is the lesson —
-`problem framing → data cleaning → baseline → first model → evaluation → explainable recommendation`.
-
----
-
-## Data safety (read `DATA_USE.md`)
-
-- Only the small **anonymized** CSV ships here — no client names, domains, URLs, titles, or keywords.
-- **Never** add raw private client data to this repo or your fork. Need more data? Request an approved
-  release from your mentor — never export it yourself.
-- Don't paste client data into third-party AI tools.
-- Frame every result as **observed / measured / directional / decision-support** — never
-  "I predicted Google's algorithm."
-
-The `.gitignore` blocks datasets by default, and CI fails any commit that includes a dataset.
-
----
-
-## Assignments & schedule
-
-Weekly assignments, live events, and the capstone live on **your portal board** (your
-enrollment email has your access link). This repo is the shared technical foundation they all
-build on — and the `skills/` folder here is the instruction library for your AI assistant
-(start at [skills/README.md](skills/README.md)).
-
-**First time with GitHub?** You need exactly four things (full walkthrough: [SETUP.md](SETUP.md)):
-1. A free account at github.com.
-2. Your own copy of this repo: **Use this template → Create a new repository** → public.
-   (One click — brings the notebooks, `work/`, and the CI leak-guard with it.)
-3. In Colab: *File → Save a copy in GitHub* — opened from your copy's badges, the dialog is
-   already pre-filled with your repo and path, so it's just OK (Colab handles auth).
-4. That's your submission repo — share its **github.com/you/your-repo** URL with Assignment 1
-   (never a colab.research.google.com or drive.google.com link).
-
----
-
-*Track leads: Mirza Ašćerić (ML) · Hole (data engineering). Code under MIT (see `LICENSE`); data under `DATA_USE.md`.*
+> Claims language: observed / measured / directional / decision-support. Base rate (0.514) is reported next to every precision figure. No causal claims. No client-identifying details. Numbers match `work/outputs/capstone_summary.json`.
